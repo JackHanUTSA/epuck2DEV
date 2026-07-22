@@ -121,6 +121,44 @@ def append_csv_row(path, data):
         writer.writerow(sample_to_csv_row(data))
 
 
+def normalize_unsigned(values):
+    values = list(values)
+    if not values:
+        return []
+    max_value = max(values)
+    if max_value <= 0:
+        return [0.0 for _ in values]
+    return [round(value / max_value, 3) for value in values]
+
+
+def normalize_signed(values):
+    values = list(values)
+    if not values:
+        return []
+    max_abs = max(abs(value) for value in values)
+    if max_abs <= 0:
+        return [0.0 for _ in values]
+    return [round(value / max_abs, 3) for value in values]
+
+
+def format_normalized_value(raw_value, normalized_value):
+    return f"{raw_value} ({normalized_value:.3f})"
+
+
+def build_normalized_view(data):
+    prox = list(data.get("prox", []))
+    ambient = list(data.get("ambient", []))
+    gyro_values = [data.get("gyro_x", 0), data.get("gyro_y", 0), data.get("gyro_z", 0)]
+    return {
+        "prox": [format_normalized_value(raw, norm) for raw, norm in zip(prox, normalize_unsigned(prox))],
+        "ambient": [format_normalized_value(raw, norm) for raw, norm in zip(ambient, normalize_unsigned(ambient))],
+        "gyro": {
+            key: format_normalized_value(raw, norm)
+            for key, raw, norm in zip(("gyro_x", "gyro_y", "gyro_z"), gyro_values, normalize_signed(gyro_values))
+        },
+    }
+
+
 def run_headless(port=PORT, csv_path=None, count=1, interval_s=0.5):
     samples = []
     total = max(1, count)
@@ -279,6 +317,7 @@ class GyroApp:
         self.plot_canvas.pack(fill="x")
         legend = tk.Label(plot_frame, text="Red = X   Blue = Y   Green = Z")
         legend.pack(anchor="w", pady=(6, 0))
+        tk.Label(plot_frame, text="Displayed sensor values use raw (normalized) format where applicable").pack(anchor="w")
 
         sensor_frame = tk.Frame(right)
         sensor_frame.pack(fill="both", expand=True, pady=(12, 0))
@@ -305,12 +344,15 @@ class GyroApp:
         self.status_var.set("Generated a new CSV path")
 
     def update_values(self, data):
+        normalized = build_normalized_view(data)
         for key, var in self.value_vars.items():
             var.set(str(data.get(key, "-")))
+        for key, value in normalized["gyro"].items():
+            self.value_vars[key].set(value)
         for idx, value in enumerate(data.get("prox", [])):
-            self.prox_vars[idx].set(str(value))
+            self.prox_vars[idx].set(normalized["prox"][idx])
         for idx, value in enumerate(data.get("ambient", [])):
-            self.ambient_vars[idx].set(str(value))
+            self.ambient_vars[idx].set(normalized["ambient"][idx])
 
         self.history["gyro_x"].append(data["gyro_x"])
         self.history["gyro_y"].append(data["gyro_y"])

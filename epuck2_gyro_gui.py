@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import argparse
 import csv
+import json
 import math
 import os
 import struct
+import sys
 import termios
 import time
 import tkinter as tk
@@ -116,6 +119,29 @@ def append_csv_row(path, data):
         if not file_exists:
             writer.writeheader()
         writer.writerow(sample_to_csv_row(data))
+
+
+def run_headless(port=PORT, csv_path=None, count=1, interval_s=0.5):
+    samples = []
+    total = max(1, count)
+    for idx in range(total):
+        data = read_gyro_sample(port)
+        samples.append(data)
+        if csv_path:
+            append_csv_row(csv_path, data)
+        if idx + 1 < total:
+            time.sleep(max(0.0, interval_s))
+    return samples
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="e-puck2 gyro/proximity reader with GUI and headless fallback")
+    parser.add_argument("--port", default=PORT, help=f"serial port (default: {PORT})")
+    parser.add_argument("--headless", action="store_true", help="run without Tk and print JSON samples")
+    parser.add_argument("--csv", help="optional CSV file path for headless logging")
+    parser.add_argument("--count", type=int, default=1, help="number of headless samples to read (default: 1)")
+    parser.add_argument("--interval", type=float, default=0.5, help="seconds between headless samples (default: 0.5)")
+    return parser.parse_args(argv)
 
 
 def read_gyro_sample(port=PORT):
@@ -369,11 +395,30 @@ class GyroApp:
             self.status_var.set("CSV logging stopped")
 
 
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+
+    no_display = not os.environ.get("DISPLAY")
+    if args.headless or no_display:
+        if no_display and not args.headless:
+            print("No DISPLAY found; falling back to headless mode.", file=sys.stderr)
+        samples = run_headless(
+            port=args.port,
+            csv_path=args.csv,
+            count=args.count,
+            interval_s=args.interval,
+        )
+        print(json.dumps(samples if len(samples) > 1 else samples[0], indent=2))
+        if args.csv:
+            print(f"CSV_LOGGED {os.path.abspath(args.csv)}", file=sys.stderr)
+        return 0
+
     root = tk.Tk()
-    GyroApp(root)
+    app = GyroApp(root)
+    app.port_var.set(args.port)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
+import csv
 import math
 import os
 import struct
 import termios
 import time
 import tkinter as tk
+from collections import deque
+from datetime import datetime
 from tkinter import messagebox
 
 PORT = "/dev/ttyACM2"
 POLL_MS = 500
-WINDOW_TITLE = "e-puck2 Gyro Reader"
+WINDOW_TITLE = "e-puck2 Gyro + Proximity Reader"
+HISTORY_SIZE = 120
+PLOT_WIDTH = 520
+PLOT_HEIGHT = 180
+PLOT_PADDING = 16
 
 
 def parse_float4(b):
@@ -66,6 +73,51 @@ def read_some(fd, timeout=1.0):
     return b"".join(chunks)
 
 
+def default_csv_path():
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.abspath(f"epuck2_gyro_log_{stamp}.csv")
+
+
+def csv_fieldnames():
+    fields = [
+        "timestamp",
+        "port",
+        "selector_raw",
+        "acceleration",
+        "orientation",
+        "inclination",
+        "gyro_x",
+        "gyro_y",
+        "gyro_z",
+        "tof_mm",
+        "button",
+        "microsd",
+    ]
+    fields.extend(f"prox_{idx}" for idx in range(8))
+    fields.extend(f"ambient_{idx}" for idx in range(8))
+    return fields
+
+
+def sample_to_csv_row(data):
+    row = {key: data.get(key, "") for key in csv_fieldnames()}
+    row["timestamp"] = datetime.now().isoformat(timespec="seconds")
+    for idx, value in enumerate(data.get("prox", [])):
+        row[f"prox_{idx}"] = value
+    for idx, value in enumerate(data.get("ambient", [])):
+        row[f"ambient_{idx}"] = value
+    return row
+
+
+def append_csv_row(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=csv_fieldnames())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(sample_to_csv_row(data))
+
+
 def read_gyro_sample(port=PORT):
     fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
     try:
@@ -82,8 +134,8 @@ def read_gyro_sample(port=PORT):
         acceleration = parse_float4(read_exact(fd, 4))
         orientation = parse_float4(read_exact(fd, 4))
         inclination = parse_float4(read_exact(fd, 4))
-        read_exact(fd, 16)  # prox
-        read_exact(fd, 16)  # ambient
+        prox = struct.unpack("<8H", read_exact(fd, 16))
+        ambient = struct.unpack("<8H", read_exact(fd, 16))
         read_exact(fd, 8)   # mics
         read_exact(fd, 2)   # battery
         gyro = struct.unpack("<3h", read_exact(fd, 6))
@@ -108,6 +160,8 @@ def read_gyro_sample(port=PORT):
             "tof_mm": tof_mm,
             "button": button,
             "microsd": microsd,
+            "prox": list(prox),
+            "ambient": list(ambient),
         }
     finally:
         os.close(fd)
@@ -118,9 +172,16 @@ class GyroApp:
         self.root = root
         self.root.title(WINDOW_TITLE)
         self.auto_refresh = False
+        self.logging_enabled = False
+        self.history = {
+            "gyro_x": deque(maxlen=HISTORY_SIZE),
+            "gyro_y": deque(maxlen=HISTORY_SIZE),
+            "gyro_z": deque(maxlen=HISTORY_SIZE),
+        }
 
         self.port_var = tk.StringVar(value=PORT)
         self.status_var = tk.StringVar(value="Ready")
+        self.csv_path_var = tk.StringVar(value=default_csv_path())
         self.value_vars = {
             "selector_raw": tk.StringVar(value="-"),
             "acceleration": tk.StringVar(value="-"),
@@ -133,19 +194,37 @@ class GyroApp:
             "button": tk.StringVar(value="-"),
             "microsd": tk.StringVar(value="-"),
         }
+        self.prox_vars = [tk.StringVar(value="-") for _ in range(8)]
+        self.ambient_vars = [tk.StringVar(value="-") for _ in range(8)]
 
         self._build_ui()
+        self.draw_plot()
 
     def _build_ui(self):
         frame = tk.Frame(self.root, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
 
-        tk.Label(frame, text="Port:").grid(row=0, column=0, sticky="w")
-        tk.Entry(frame, textvariable=self.port_var, width=24).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        top = tk.Frame(frame)
+        top.pack(fill="x")
 
-        tk.Button(frame, text="Read Once", command=self.read_once).grid(row=0, column=2, padx=(10, 0))
-        self.auto_button = tk.Button(frame, text="Start Auto Refresh", command=self.toggle_auto)
+        tk.Label(top, text="Port:").grid(row=0, column=0, sticky="w")
+        tk.Entry(top, textvariable=self.port_var, width=24).grid(row=0, column=1, sticky="ew", padx=(6, 6))
+        tk.Button(top, text="Read Once", command=self.read_once).grid(row=0, column=2, padx=(4, 0))
+        self.auto_button = tk.Button(top, text="Start Auto Refresh", command=self.toggle_auto)
         self.auto_button.grid(row=0, column=3, padx=(6, 0))
+
+        tk.Label(top, text="CSV:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        tk.Entry(top, textvariable=self.csv_path_var, width=48).grid(row=1, column=1, columnspan=2, sticky="ew", padx=(6, 6), pady=(8, 0))
+        self.log_button = tk.Button(top, text="Start CSV Logging", command=self.toggle_logging)
+        self.log_button.grid(row=1, column=3, padx=(6, 0), pady=(8, 0))
+        tk.Button(top, text="New CSV Path", command=self.reset_csv_path).grid(row=1, column=4, padx=(6, 0), pady=(8, 0))
+        top.columnconfigure(1, weight=1)
+
+        middle = tk.Frame(frame)
+        middle.pack(fill="both", expand=True, pady=(12, 0))
+
+        values_frame = tk.LabelFrame(middle, text="Current values", padx=8, pady=8)
+        values_frame.pack(side="left", fill="y")
 
         fields = [
             ("Selector", "selector_raw"),
@@ -159,23 +238,101 @@ class GyroApp:
             ("Button", "button"),
             ("microSD", "microsd"),
         ]
-
-        for idx, (label_text, key) in enumerate(fields, start=1):
-            tk.Label(frame, text=label_text + ":").grid(row=idx, column=0, sticky="w", pady=2)
-            tk.Label(frame, textvariable=self.value_vars[key], anchor="w", width=24, relief="sunken").grid(
-                row=idx, column=1, columnspan=3, sticky="ew", padx=(6, 0), pady=2
+        for idx, (label_text, key) in enumerate(fields):
+            tk.Label(values_frame, text=label_text + ":", anchor="w").grid(row=idx, column=0, sticky="w", pady=2)
+            tk.Label(values_frame, textvariable=self.value_vars[key], anchor="w", width=18, relief="sunken").grid(
+                row=idx, column=1, sticky="ew", padx=(6, 0), pady=2
             )
 
-        tk.Label(frame, textvariable=self.status_var, anchor="w", fg="blue").grid(
-            row=len(fields) + 1, column=0, columnspan=4, sticky="ew", pady=(12, 0)
-        )
+        right = tk.Frame(middle)
+        right.pack(side="left", fill="both", expand=True, padx=(12, 0))
 
-        frame.columnconfigure(1, weight=1)
+        plot_frame = tk.LabelFrame(right, text="Live gyro plot", padx=8, pady=8)
+        plot_frame.pack(fill="x")
+        self.plot_canvas = tk.Canvas(plot_frame, width=PLOT_WIDTH, height=PLOT_HEIGHT, bg="white", highlightthickness=1)
+        self.plot_canvas.pack(fill="x")
+        legend = tk.Label(plot_frame, text="Red = X   Blue = Y   Green = Z")
+        legend.pack(anchor="w", pady=(6, 0))
+
+        sensor_frame = tk.Frame(right)
+        sensor_frame.pack(fill="both", expand=True, pady=(12, 0))
+
+        prox_frame = tk.LabelFrame(sensor_frame, text="Proximity", padx=8, pady=8)
+        prox_frame.pack(side="left", fill="both", expand=True)
+        ambient_frame = tk.LabelFrame(sensor_frame, text="Ambient", padx=8, pady=8)
+        ambient_frame.pack(side="left", fill="both", expand=True, padx=(12, 0))
+
+        for idx in range(8):
+            tk.Label(prox_frame, text=f"P{idx}:", anchor="w").grid(row=idx, column=0, sticky="w", pady=2)
+            tk.Label(prox_frame, textvariable=self.prox_vars[idx], anchor="w", width=10, relief="sunken").grid(
+                row=idx, column=1, sticky="ew", padx=(6, 0), pady=2
+            )
+            tk.Label(ambient_frame, text=f"A{idx}:", anchor="w").grid(row=idx, column=0, sticky="w", pady=2)
+            tk.Label(ambient_frame, textvariable=self.ambient_vars[idx], anchor="w", width=10, relief="sunken").grid(
+                row=idx, column=1, sticky="ew", padx=(6, 0), pady=2
+            )
+
+        tk.Label(frame, textvariable=self.status_var, anchor="w", fg="blue").pack(fill="x", pady=(12, 0))
+
+    def reset_csv_path(self):
+        self.csv_path_var.set(default_csv_path())
+        self.status_var.set("Generated a new CSV path")
 
     def update_values(self, data):
         for key, var in self.value_vars.items():
             var.set(str(data.get(key, "-")))
-        self.status_var.set(f"Last read ok from {data['port']}")
+        for idx, value in enumerate(data.get("prox", [])):
+            self.prox_vars[idx].set(str(value))
+        for idx, value in enumerate(data.get("ambient", [])):
+            self.ambient_vars[idx].set(str(value))
+
+        self.history["gyro_x"].append(data["gyro_x"])
+        self.history["gyro_y"].append(data["gyro_y"])
+        self.history["gyro_z"].append(data["gyro_z"])
+        self.draw_plot()
+
+        if self.logging_enabled:
+            append_csv_row(self.csv_path_var.get().strip(), data)
+
+        status = f"Last read ok from {data['port']}"
+        if self.logging_enabled:
+            status += f" | logging to {self.csv_path_var.get().strip()}"
+        self.status_var.set(status)
+
+    def draw_plot(self):
+        c = self.plot_canvas
+        c.delete("all")
+        width = PLOT_WIDTH
+        height = PLOT_HEIGHT
+        left = PLOT_PADDING
+        right = width - PLOT_PADDING
+        top = PLOT_PADDING
+        bottom = height - PLOT_PADDING
+
+        c.create_rectangle(left, top, right, bottom, outline="#bbbbbb")
+        mid_y = (top + bottom) / 2
+        c.create_line(left, mid_y, right, mid_y, fill="#dddddd", dash=(4, 3))
+
+        all_values = [value for series in self.history.values() for value in series]
+        if not all_values:
+            c.create_text(width / 2, height / 2, text="No samples yet", fill="#777777")
+            return
+
+        max_abs = max(max(abs(v) for v in all_values), 1)
+        c.create_text(left + 28, top + 10, text=f"±{max_abs}", fill="#666666")
+
+        colors = {"gyro_x": "#d62728", "gyro_y": "#1f77b4", "gyro_z": "#2ca02c"}
+        for key, color in colors.items():
+            points = list(self.history[key])
+            if len(points) < 2:
+                continue
+            xy = []
+            x_step = (right - left) / max(len(points) - 1, 1)
+            for idx, value in enumerate(points):
+                x = left + idx * x_step
+                y = mid_y - ((value / max_abs) * ((bottom - top) / 2 - 4))
+                xy.extend([x, y])
+            c.create_line(*xy, fill=color, width=2, smooth=False)
 
     def read_once(self):
         try:
@@ -202,10 +359,19 @@ class GyroApp:
             self.auto_button.config(text="Start Auto Refresh")
             self.status_var.set("Auto refresh stopped")
 
+    def toggle_logging(self):
+        self.logging_enabled = not self.logging_enabled
+        if self.logging_enabled:
+            self.log_button.config(text="Stop CSV Logging")
+            self.status_var.set(f"CSV logging armed: {self.csv_path_var.get().strip()}")
+        else:
+            self.log_button.config(text="Start CSV Logging")
+            self.status_var.set("CSV logging stopped")
+
 
 def main():
     root = tk.Tk()
-    app = GyroApp(root)
+    GyroApp(root)
     root.mainloop()
 
 
